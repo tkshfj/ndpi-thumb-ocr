@@ -1,0 +1,11 @@
+# Core image + OCR
+Pillow>=10.0.0
+pytesseract>=0.3.10
+numpy>=1.26.0
+opencv-python>=4.8.0
+
+# WSI thumbnails (Python bindings)
+openslide-python>=1.3.1
+
+# Bundled OpenSlide native library (recommended on macOS/Windows; harmless on Linux)
+openslide-bin>=4.0.0

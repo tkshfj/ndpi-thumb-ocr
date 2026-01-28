@@ -8,17 +8,17 @@ We are building a command-line repository that:
 
 * Organizes NDPI whole-slide images into per-slide folders.
 * Generates Explorer-friendly JPEG thumbnails (`folder.jpg`).
-* Extracts text from slide label/thumbnail images using OCR and writes results next to the thumbnail as `folder.ocr.txt`.
-* Optionally decodes QR codes from the same label/thumbnail image and includes the decoded payload alongside OCR output.
+* Extracts label/thumbnail text using OCR and saves results as `folder.ocr.txt` for indexing and search.
+* Optionally decodes QR codes from the same label/thumbnail image and includes the decoded payload alongside OCR output (only when `--qr` is specified).
 
-Primary pain points addressed during refactoring:
+Key issues addressed during refactoring:
 
-* Poor OCR accuracy due to rotated label images.
-* OCR output losing edge characters due to rotation + cropping interactions.
-* Excessive runtime caused by too many OCR candidate combinations.
-* Dependency issues on macOS regarding OpenSlide dylib availability.
-* Code-quality issues (unused parameters, undefined names, cognitive complexity, unexpected keyword args).
-* Consistent configuration and CLI behavior for OCR/QR features.
+* OCR quality degraded by label orientation and small text.
+* OCR edge character loss due to crop/rotation interactions.
+* Runtime increased due to excessive candidate search.
+* macOS OpenSlide dylib load failures.
+* Code-quality issues (unexpected kwargs, complexity, toggles not honored).
+* Consistent, explicit CLI behavior for OCR/QR.
 
 ---
 
@@ -34,19 +34,30 @@ Each slide `X.ndpi` is moved into a folder `X/slide.ndpi`:
 Within each slide folder:
 
 * `folder.jpg` — JPEG thumbnail used by Windows Explorer folder preview.
-* `folder.ocr.txt` — OCR and optional QR decoded results.
+* `folder.ocr.txt` — OCR output, and QR payload if enabled.
+
+### Setup
+
+```bash
+cd /path/to/repository
+source .venv/bin/activate
+```
 
 ### 2.2 CLI usage
 
 Example run (OCR + QR):
 
-Generates `folder.jpg` and writes `[QR]` and `[OCR]` sections into `folder.ocr.txt`:
-
 ```bash
 python make_thumbs.py --root ./data --ocr --qr
 ```
 
-OCR only:
+Dry run:
+
+```bash
+python make_thumbs.py --root ./data --ocr --qr --dry-run
+```
+
+### Basic run (OCR only)
 
 Generates `folder.jpg` and writes OCR output to `folder.ocr.txt`:
 
@@ -54,7 +65,15 @@ Generates `folder.jpg` and writes OCR output to `folder.ocr.txt`:
 python make_thumbs.py --root ./data --ocr
 ```
 
-Dry run:
+### OCR + QR run
+
+Generates `folder.jpg` and writes `[QR]` and `[OCR]` sections into `folder.ocr.txt`:
+
+```bash
+python make_thumbs.py --root ./data --ocr --qr
+```
+
+### Dry run (no file changes)
 
 Shows what would be moved/written, without modifying files:
 
@@ -62,7 +81,7 @@ Shows what would be moved/written, without modifying files:
 python make_thumbs.py --root ./data --ocr --qr --dry-run
 ```
 
-#### Common options
+### Common options
 
 * Enable OCR output:
 
@@ -85,8 +104,11 @@ python make_thumbs.py --root ./data --ocr --qr --dry-run
 * Disable auto-rotate:
 
   * `--no-ocr-auto-rotate`
+* Set QR rotation candidates:
 
-#### Expected outputs per slide folder
+  * `--qr-rotations "0,-90"`
+
+### Expected outputs per slide folder
 
 After running, each slide folder contains:
 
@@ -98,212 +120,104 @@ After running, each slide folder contains:
 
 ## 3. Dependency and environment notes
 
-### 3.1 Tesseract (macOS Homebrew)
+### 3.1 Tesseract
 
-We validated Tesseract installation:
-
-* `tesseract --version` showed Tesseract 5.5.2.
-* `tesseract --list-langs` confirmed `eng`, `jpn`, and many others installed.
-* Homebrew prefix: `/opt/homebrew/opt/tesseract`
-
-We are using `lang_candidates` including `"jpn+eng"` to support mixed Japanese/English labels.
+We use Tesseract via `pytesseract` with mixed-language candidates such as `"jpn+eng"` to support Japanese/English labels.
 
 ### 3.2 OpenSlide dylib issue (macOS)
 
-When running OCR/QR extraction, we hit an OpenSlide loader error indicating that `openslide-python` bindings were present but the OpenSlide dynamic library was not available.
+We hit an OpenSlide loader error when `openslide-python` was installed but the OpenSlide dynamic library was not found.
 
-Fix: include `openslide-bin` in dependencies (macOS-friendly wheel shipping OpenSlide library).
+Fix: include `openslide-bin` so the OpenSlide library is available on macOS.
 
 ### 3.3 Requirements
 
-Refactored `requirements.txt` includes:
+Current `requirements.txt` includes:
 
 * `openslide-python`
 * `openslide-bin`
 * `Pillow`
 * `pytesseract`
 * `numpy`
-* `opencv-python` (for QR decoding via `cv2.QRCodeDetector`)
+* `opencv-python` (QR decoding via OpenCV `QRCodeDetector`)
 
 ---
 
 ## 4. OCR pipeline refactor
 
-### 4.1 Problem: OCR on rotated thumbnails
+### 4.1 OCR configuration (`OcrCfg`)
 
-Initial OCR output was poor because label images were not aligned with expected text orientation.
+The OCR config supports:
 
-We introduced rotation search and scoring:
+* Language candidates (`lang_candidates`)
+* PSM candidates (`psm_candidates`)
+* Preprocessing: upscale, contrast, optional threshold, sharpen
+* Rotation strategy: forced rotation or a small candidate set when auto-rotating
+* Label cropping toggle and heuristic fallback
+* Early stop threshold for speed
 
-* Try candidate rotations and select the best result based on confidence derived from `pytesseract.image_to_data`.
-* Then run `image_to_string` only once for the best candidate.
+#### Recommendation status integrated
 
-### 4.2 OCR config (`OcrCfg`)
+* **8.3 Make OCR crop toggle effective — Implemented.**
+  `--ocr-no-crop-label` is honored when building `OcrCfg` (label cropping can be turned off).
 
-Final refactored `OcrCfg`:
+* **8.4 Ensure auto-rotate toggle is honored — Implemented.**
+  `--no-ocr-auto-rotate` is wired into `OcrCfg.auto_rotate`. Duplicate/competing controls were consolidated so the dedicated toggle is the authoritative control.
 
-```python
-@dataclass(frozen=True)
-class OcrCfg:
-    enabled: bool = False
-    lang_candidates: tuple[str, ...] = ("jpn+eng", "jpn", "eng")
-    psm_candidates: tuple[int, ...] = (6, 11)
+### 4.2 Candidate search and performance
 
-    oem: int = 3
-    upscale: int = 6
-    threshold: Optional[int] = None
-    sharpen: bool = True
+We use a two-stage approach:
 
-    auto_rotate: bool = True
-    rotate_degrees: Optional[int] = None
-    rotation_candidates: tuple[int, ...] = (0, -90)
+1. Score candidates using `pytesseract.image_to_data` (confidence-based).
+2. Run `pytesseract.image_to_string` once for the best candidate.
 
-    crop_label: bool = True
-    label_width_ratio: float = 0.33
-    early_stop_conf: float = 75.0
-```
+We reduce runtime by:
 
-### 4.3 Candidate generation approach
+* Restricting rotation candidates to a small set.
+* Keeping regions minimal (label-first).
+* Early stopping when confidence exceeds `early_stop_conf`.
 
-* Crop label region first.
-* Rotate each candidate from the configured rotation set.
-* Pad with white border to reduce edge glyph loss.
-* Optionally generate a “trim bottom” candidate only for the unrotated orientation.
+### 4.3 Edge character preservation
 
-Key logic:
+To reduce glyph loss at edges:
 
-```python
-for deg in rotations:
-    rot = _rotate(rimg, deg)
-    yield (_pad_white(rot), lang, psm)
-    if deg == 0:
-        yield (_pad_white(_trim_bottom(rot, 0.25)), lang, psm)
-```
-
-### 4.4 Preprocessing
-
-`preprocess_for_ocr` includes:
-
-* grayscale
-* upscale (LANCZOS)
-* autocontrast
-* contrast boost
-* optional threshold
-* unsharp mask
-
-```python
-g = img.convert("L")
-g = g.resize((w * cfg.upscale, h * cfg.upscale), resample=Image.Resampling.LANCZOS)
-g = ImageOps.autocontrast(g)
-g = ImageEnhance.Contrast(g).enhance(1.5)
-if cfg.threshold is not None:
-    g = g.point(lambda x: 255 if x >= t else 0, mode="1").convert("L")
-if cfg.sharpen:
-    g = g.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
-```
+* We pad candidate images with a white border before OCR.
+* We avoid trimming left edges.
+* We only create a “trim bottom” variant in controlled cases.
 
 ---
 
 ## 5. Label crop heuristic improvements
 
-### 5.1 Problem: crop heuristic was sensitive
+The crop heuristic was made more robust by:
 
-Earlier logic using full-height column means could be thrown off by borders, dark tissue/pen marks, or slide-holder regions.
-
-### 5.2 Fix: compute mean over middle band and constrain search width
-
-Implemented in `find_label_crop_box`:
-
-* Use only middle band of rows.
-* Use a slightly higher “dark” threshold.
-* Search for separator only within a bounded X-range.
-* Add crop margin and minimum crop width.
-
-Core code:
-
-```python
-y0 = int(h * 0.15)
-y1 = int(h * 0.85)
-band = arr[y0:y1, :]
-col_mean = band.mean(axis=0)
-dark = col_mean < 60
-
-x_start = int(w * 0.10)
-x_end = int(w * 0.70)
-
-# find longest dark run
-...
-right = max(int(w * 0.20), start + 10)
-right = min(w, right)
-return (0, 0, right, h)
-```
-
-Fallback remains:
-
-```python
-right = int(w * cfg.label_width_ratio)
-return (0, 0, max(1, right), h)
-```
+* Computing column mean intensity over the middle vertical band of rows (reduces border/corner interference).
+* Searching for the separator band only in a bounded x-range (avoids locking onto borders).
+* Enforcing a minimum crop width and adding a margin.
+* Falling back to a fixed left-width ratio when no separator is detected.
 
 ---
 
-## 6. Runtime performance improvements
+## 6. QR decoding integration
 
-### 6.1 Problem: OCR became slower after adding candidate search
+### 6.1 QR config (`QrCfg`) and decoding
 
-A brute-force search across:
+* QR decoding uses OpenCV’s `cv2.QRCodeDetector`.
+* We try configured rotation candidates for QR decoding.
+* Output is merged into the same `folder.ocr.txt` file.
 
-* regions × rotations × lang candidates × psm candidates
+#### Recommendation status integrated
 
-can be expensive.
+* **8.1 Ensure `--qr` is required for QR decoding — Implemented.**
+  QR decoding runs only when `--qr` is specified. `QrCfg` is built in `__main__` and passed into processing functions.
 
-### 6.2 Fixes applied
+* **8.2 Align QR rotation config with chosen rotation set — Partially implemented.**
+  Defaults are aligned between OCR and QR configs. `--qr-rotations` exists and can be set to match OCR rotation candidates.
+  Remaining gap: QR rotations are not automatically derived from OCR rotations. If OCR is forced to a specific rotation, QR still uses `--qr-rotations` unless we also change it explicitly.
 
-* Restrict rotation candidates to a small set.
-* Keep region set small (label-first).
-* Two-stage OCR:
+### 6.2 Output format
 
-  * `image_to_data` for scoring.
-  * `image_to_string` once for final.
-* Early stop when confidence exceeds `early_stop_conf`.
-
----
-
-## 7. QR decoding integration
-
-### 7.1 Goal
-
-In addition to OCR, decode QR codes embedded on label images and include decoded payload in output.
-
-### 7.2 QR config (`QrCfg`)
-
-```python
-@dataclass(frozen=True)
-class QrCfg:
-    enabled: bool = False
-    rotation_candidates: tuple[int, ...] = (0, -90)
-```
-
-### 7.3 QR decoding (`decode_qr`)
-
-Using OpenCV:
-
-```python
-def decode_qr(img: Image.Image, cfg: QrCfg) -> Optional[str]:
-    if not cfg.enabled:
-        return None
-    det = cv2.QRCodeDetector()
-    for deg in cfg.rotation_candidates:
-        cand = img.rotate(deg, expand=True)
-        data, _, _ = det.detectAndDecode(_to_cv(cand))
-        if data:
-            return data.strip()
-    return None
-```
-
-### 7.4 Combined output format
-
-When QR is enabled:
+When `--qr` is enabled:
 
 ```
 [QR]
@@ -313,133 +227,42 @@ When QR is enabled:
 <ocr text>
 ```
 
-When QR is disabled:
+When `--qr` is not enabled:
 
-* Output remains OCR-only (backward compatible).
-
----
-
-## 8. `make_thumbs.py` refactor and structure
-
-### 8.1 Cover/thumbnail generation
-
-* Prefer associated images for cover: `thumbnail`, `macro`, `label`.
-* Fallback to rendered thumbnail.
-
-### 8.2 OCR source selection
-
-Prefer:
-
-* `label`
-* `macro`
-* `thumbnail`
-
-Fallback to larger render for OCR:
-
-```python
-return slide.get_thumbnail(cfg.ocr_render_size).convert("RGB")
-```
-
-### 8.3 Atomic writes
-
-* JPEG: write `.tmp` then replace.
-* Text: write `.tmp` then replace.
-
-This reduces partial writes on SMB.
-
-### 8.4 Output orchestration
-
-Refactored `_process_outputs` delegates to `_write_cover` and `_write_text`:
-
-```python
-if not is_up_to_date(ndpi_inside, out_jpg):
-    _write_cover(...)
-
-if out_txt is not None and not is_up_to_date(ndpi_inside, out_txt):
-    _write_text(..., qr_cfg=qr_cfg)
-```
-
-Text builder merges QR + OCR:
-
-```python
-ocr_text = ocr_image(ocr_src, ocr_cfg)
-qr_text = decode_qr(ocr_src, qr_cfg) if qr_cfg.enabled else None
-```
+* Output remains OCR-only.
 
 ---
 
-## 9. Code quality and linting concerns addressed
+## 7. `make_thumbs.py` refactor and structure
 
-We encountered and addressed issues including:
+### 7.1 Cover generation
 
-* Removing unused function parameters in earlier versions.
-* Fixing undefined names by aligning imports and helper usage.
-* Eliminating unexpected named arguments by aligning function signatures.
-* Reducing cognitive complexity by extracting nested logic into helpers.
-* Resolving static-analysis warnings by simplifying nested conditions and loop structure.
+* Prefer embedded associated images (`thumbnail`, `macro`, `label`) for `folder.jpg`.
+* Fallback to `slide.get_thumbnail()`.
 
----
+### 7.2 OCR source selection
 
-## 10. Remaining recommended refinements
+* Prefer associated images (`label`, `macro`, `thumbnail`) for OCR.
+* Fallback to a larger render size if needed.
 
-### 10.1 Ensure `--qr` is required for QR decoding
+### 7.3 Atomic writes
 
-QR decoding should run only when `--qr` is specified, and QR configuration should be created in `__main__` and passed down to processing functions.
+* Both JPEG and text outputs are written via temp files and replaced atomically to reduce partial writes on SMB.
 
-### 10.2 Align QR rotation config with chosen rotation set
+### 7.4 QR is not hardcoded
 
-Ensure QR decoding uses the same rotation candidate set as OCR.
-
-### 10.3 Make OCR crop toggle effective
-
-Honor `--ocr-no-crop-label` when building `OcrCfg`:
-
-```python
-crop_label=not args.ocr_no_crop_label
-```
-
-### 10.4 Ensure auto-rotate toggle is honored
-
-Use the dedicated argparse toggle (`--no-ocr-auto-rotate`) consistently when constructing `OcrCfg`, and avoid duplicate flags that control the same behavior.
+* QR is enabled only via `--qr`.
+* `QrCfg` is constructed in `__main__` and passed down through processing functions.
 
 ---
 
-## 11. Reference code excerpts (final refactored core)
+## 8. Summary of decisions
 
-### 11.1 OCR scoring + final OCR
+* Use `openslide-bin` to avoid OpenSlide loader failures on macOS.
+* Use mixed-language OCR candidates (notably `"jpn+eng"`).
+* Improve label cropping robustness with middle-band analysis and bounded separator detection.
+* Improve OCR stability and speed using preprocessing, candidate scoring, padding, and early stopping.
+* Add optional QR decoding via OpenCV, enabled only via `--qr`, and merge output with OCR in `folder.ocr.txt`.
+* Refactor for maintainability by separating cover writing, OCR/QR text building, and low-level OCR/QR utilities.
 
-```python
-def ocr_image(img: Image.Image, cfg: "OcrCfg") -> str:
-    best = None
-    for cand_img, lang, psm in _iter_candidates(img, cfg):
-        score = _score_candidate(cand_img, cfg, lang=lang, psm=psm)
-        if best is None or score > best[0]:
-            best = (score, cand_img, lang, psm)
-        if score >= cfg.early_stop_conf:
-            best = (score, cand_img, lang, psm)
-            break
-    if best is None:
-        return ""
-    _, best_img, best_lang, best_psm = best
-    return _final_ocr(best_img, cfg, lang=best_lang, psm=best_psm)
-```
-
-### 11.2 Output writer
-
-```python
-def _write_text(..., qr_cfg: Optional["QrCfg"] = None) -> None:
-    ocr_src = choose_image_for_ocr(slide, cfg)
-    text = _build_text_output(ocr_src, ocr_cfg, qr_cfg=qr_cfg)
-    write_text_atomic(out_txt, text)
-```
-
----
-
-## 12. Summary of decisions
-
-* Include `openslide-bin` to avoid OpenSlide loader errors on macOS.
-* Use Tesseract language candidates including `"jpn+eng"` for mixed-language labels.
-* Improve label cropping via middle-band intensity analysis and bounded separator detection.
-* Improve OCR robustness with preprocessing, candidate scoring, padding, and early stopping.
-* Integrate optional QR decoding via OpenCV and merge QR payload with OCR output.
-* Refactor for maintainability by separating concerns into helper functions and utility modules.
+If we want to close the remaining gap in QR/OCR rotation alignment, we can auto-default QR rotations to the OCR rotation set when `--qr-rotations` is not provided (while still allowing explicit override).
